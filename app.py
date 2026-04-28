@@ -114,7 +114,7 @@ JSON 형식 예시:
 
     # 4) Gemini 호출
     response = client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="gemini-2.5-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[grounding_tool],
