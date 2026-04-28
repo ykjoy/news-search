@@ -192,7 +192,7 @@ JSON 형식 예시:
 def render_article_card(idx: int, article: dict) -> None:
     """
     뉴스 1건을 테두리가 있는 카드 형태로 화면에 출력한다.
-
+    
     Args:
         idx (int): 카드 번호 (1부터 시작)
         article (dict): 뉴스 1건 정보
