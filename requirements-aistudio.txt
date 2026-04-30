@@ -1,4 +1,0 @@
-streamlit
-feedparser
-google-generativeai
-pandas
