@@ -12,7 +12,7 @@ class NewsItem(BaseModel):
     title: str
     url: str
     summary: str
-
+ 
 class NewsList(BaseModel):
     news: list[NewsItem]
 
