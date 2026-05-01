@@ -1,132 +1,109 @@
 import streamlit as st
-import pandas as pd
-import os
 import json
+import re
+import pandas as pd
 from google import genai
 from google.genai import types
 
-# ---------------------------------------------------------
-# 1. Streamlit UI 기본 설정 및 헤더
-# ---------------------------------------------------------
+# ----------------------------------------------------
+# 1. 페이지 기본 설정 및 안내 문구
+# ----------------------------------------------------
 st.set_page_config(page_title="최신 뉴스 검색기", page_icon="📰", layout="centered")
 
-st.title("📰 최신 뉴스 검색 앱 (with Gemini)")
-st.info("💡 **안내:** 이 앱은 `gemini-2.5-flash-lite` 모델의 무료 티어를 사용합니다.\n"
-        "(제한: 분당 15회, 일일 1,500회 요청 가능). \n"
-        "너무 짧은 시간에 연속으로 검색하면 에러가 발생할 수 있으니 천천히 이용해 주세요.")
+st.title("최신 뉴스 검색기 📰")
+# 무료 티어 제한 안내 문구 (요구사항 3)
+st.warning("💡 **안내:** 현재 Gemini API 무료 티어를 사용 중입니다. (분당 15회 요청 제한이 발생할 수 있습니다.)")
 
-# ---------------------------------------------------------
-# 2. API 키 확인 및 Gemini 클라이언트 초기화
-# ---------------------------------------------------------
-api_key = os.environ.get("GEMINI_API_KEY")
+# ----------------------------------------------------
+# 2. 검색 UI 및 Session State 초기화
+# ----------------------------------------------------
+# 다운로드 버튼을 눌러도 화면이 날아가지 않도록 상태(State)를 저장합니다.
+if 'news_data' not in st.session_state:
+    st.session_state['news_data'] = None
 
-if not api_key:
-    st.error("🚨 환경 변수에 'GEMINI_API_KEY'가 설정되지 않았습니다.")
-    st.stop()
+keyword = st.text_input("궁금한 최신 뉴스 키워드를 입력하세요 (예: AI 인공지능, 한국 야구):")
 
-# 명시적으로 API 키를 전달
-client = genai.Client(api_key=api_key)
-
-# ---------------------------------------------------------
-# 3. 사용자 입력 및 검색 실행
-# ---------------------------------------------------------
-keyword = st.text_input("🔍 검색하고 싶은 뉴스 키워드를 입력하세요 (예: 인공지능, 전기차, 부동산 등)")
-
-if st.button("뉴스 검색하기", type="primary"):
+# ----------------------------------------------------
+# 3. 뉴스 검색 버튼 클릭 시 동작
+# ----------------------------------------------------
+if st.button("뉴스 검색 🔍"):
     if not keyword:
-        st.warning("키워드를 입력해 주세요!")
+        st.error("키워드를 입력해주세요!")
     else:
-        with st.spinner(f"'{keyword}'에 대한 최신 뉴스를 구글에서 검색하고 요약하는 중입니다... ⏳"):
+        with st.spinner(f"'{keyword}' 관련 최신 뉴스를 검색하고 요약하는 중입니다..."):
             try:
-                # 프롬프트를 아주 강력하게 작성 (JSON 형태 요구)
+                # 클라이언트 초기화 (Codespaces Secret에 등록한 GEMINI_API_KEY를 자동 인식함)
+                client = genai.Client()
+                
+                # 프롬프트: 검색 도구와 강제 JSON 기능은 동시 사용이 안되므로, 
+                # 프롬프트 자체에서 JSON 형태의 텍스트만 출력하도록 강력하게 지시합니다.
                 prompt = f"""
-'{keyword}'에 대한 최신 뉴스를 구글에서 검색해줘.
-정확히 5건의 서로 다른 최근 뉴스를 찾아야 해.
-
-[주의사항]
-1. 각 뉴스에 대해 'title'(기사 제목), 'url'(원본 기사 URL), 'summary'(3~4문장 분량의 한국어 요약)를 포함해.
-2. 답변은 반드시 아래 예시와 같이 완벽한 JSON 배열(Array) 형태로만 출력해.
-3. JSON 외에 인사말이나 설명 등 다른 텍스트는 절대 포함하지 마.[출력 예시][
-  {{
-    "title": "첫번째 기사 제목",
-    "url": "https://...",
-    "summary": "첫번째 기사 요약..."
-  }},
-  {{
-    "title": "두번째 기사 제목",
-    "url": "https://...",
-    "summary": "두번째 기사 요약..."
-  }}
-]
-"""
-
-                # Gemini API 호출 (에러가 나던 JSON 설정 제거, 검색 도구만 유지)
+                다음 키워드에 대한 최신 뉴스 5건을 검색해줘: {keyword}
+                
+                반드시 아래의 JSON 배열(Array) 형식으로만 응답해야 해. 
+                다른 인사말이나 마크다운(```json 등)은 절대 포함하지 말고, 오직 순수한 JSON만 출력해.[
+                    {{
+                        "title": "뉴스 기사의 정확한 제목",
+                        "url": "뉴스 기사의 원본 링크",
+                        "summary": "해당 뉴스 내용에 대한 3~4문장의 상세한 요약"
+                    }}
+                ]
+                """
+                
+                # Gemini 2.5 Flash Lite 모델 호출 (Google Search 도구 포함)
                 response = client.models.generate_content(
                     model='gemini-2.5-flash-lite',
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        tools=[{"google_search": {}}],
-                        temperature=0.2, # 온도를 낮춰서 더 규칙을 잘 따르도록 설정
+                        tools=[{"google_search": {}}], # 구글 검색 기능 활성화
+                        temperature=0.2, # 일관된 JSON 출력을 위해 온도를 낮춤
                     )
                 )
-
-                # ---------------------------------------------------------
-                # 4. 문자열(Text) 응답을 파이썬 List/Dict(JSON)로 변환
-                # ---------------------------------------------------------
-                raw_text = response.text.strip()
                 
-                # AI가 마크다운 코드블록(```json ... ```)으로 감싸서 줄 경우를 대비해 벗겨내기
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text[7:]
-                if raw_text.startswith("```"):
-                    raw_text = raw_text[3:]
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
-                    
-                raw_text = raw_text.strip()
-
-                # 문자열을 파이썬 객체로 변환
-                news_data = json.loads(raw_text)
+                # 모델이 응답한 텍스트에서 안전하게 JSON 부분만 추출 (정규표현식 사용)
+                raw_text = response.text
+                match = re.search(r'\[\s*\{.*?\}\s*\]', raw_text, re.DOTALL)
                 
-                if not news_data:
-                    st.warning("검색된 뉴스 결과가 없습니다.")
+                if match:
+                    json_str = match.group(0)
+                    # 문자열을 파이썬 리스트(딕셔너리)로 변환
+                    news_data = json.loads(json_str) 
+                    # 결과를 세션 스테이트에 저장 (화면 유지용)
+                    st.session_state['news_data'] = news_data
                 else:
-                    st.success("뉴스 검색 및 요약이 완료되었습니다! 🎉")
+                    st.error("결과를 JSON으로 변환하는 데 실패했습니다. 다시 시도해 주세요.")
+                    st.write("원본 응답:", raw_text)
                     
-                    # ---------------------------------------------------------
-                    # 5. 카드 형태 UI 출력 및 CSV 데이터 수집
-                    # ---------------------------------------------------------
-                    csv_data =[]
-                    
-                    for i, item in enumerate(news_data):
-                        with st.container(border=True):
-                            st.subheader(f"{i+1}. {item.get('title', '제목 없음')}")
-                            st.write(f"**📝 요약:** {item.get('summary', '요약 없음')}")
-                            st.markdown(f"**🔗 원본 링크:** [기사 보러가기]({item.get('url', '#')})")
-                            
-                        csv_data.append({
-                            "번호": i + 1,
-                            "제목": item.get('title', ''),
-                            "요약": item.get('summary', ''),
-                            "URL": item.get('url', '')
-                        })
-                    
-                    # ---------------------------------------------------------
-                    # 6. CSV 다운로드 버튼 생성
-                    # ---------------------------------------------------------
-                    df = pd.DataFrame(csv_data)
-                    csv = df.to_csv(index=False).encode('utf-8-sig')
-                    
-                    st.write("---")
-                    st.download_button(
-                        label="📥 검색 결과 CSV 파일로 다운로드",
-                        data=csv,
-                        file_name=f"{keyword}_최신뉴스.csv",
-                        mime="text/csv"
-                    )
-
-            except json.JSONDecodeError:
-                st.error("AI가 올바른 JSON 형태로 답변을 주지 않았습니다. 다시 시도해 주세요.")
-                st.write("원본 응답 데이터:", response.text) # 원인 파악을 위해 출력
             except Exception as e:
-                st.error(f"오류가 발생했습니다. 상세 오류: {e}")
+                st.error(f"API 호출 중 오류가 발생했습니다: {e}")
+
+# ----------------------------------------------------
+# 4. 결과 출력 및 CSV 다운로드 (요구사항 2)
+# ----------------------------------------------------
+if st.session_state['news_data']:
+    news_list = st.session_state['news_data']
+    
+    st.success("검색이 완료되었습니다!")
+    
+    # CSV 다운로드 기능 준비
+    df = pd.DataFrame(news_list)
+    # 한글 깨짐 방지를 위해 utf-8-sig로 인코딩
+    csv = df.to_csv(index=False).encode('utf-8-sig') 
+    
+    # 다운로드 버튼 (누르더라도 Session State 덕분에 화면이 지워지지 않음)
+    st.download_button(
+        label="📥 결과 CSV 파일로 다운로드",
+        data=csv,
+        file_name=f"latest_news_{keyword}.csv",
+        mime="text/csv",
+    )
+    
+    st.markdown("---")
+    
+    # 카드 형태로 결과 예쁘게 보여주기
+    for idx, news in enumerate(news_list):
+        # 테두리가 있는 컨테이너 생성 (카드 UI 효과)
+        with st.container(border=True):
+            st.subheader(f"{idx+1}. {news.get('title', '제목 없음')}")
+            st.write(f"**요약:** {news.get('summary', '요약 정보가 없습니다.')}")
+            st.markdown(f"[🔗 원본 기사 읽기]({news.get('url', '#')})")
