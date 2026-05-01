@@ -1,109 +1,108 @@
 import streamlit as st
+import pandas as pd
 import json
 import re
-import pandas as pd
+import os
 from google import genai
 from google.genai import types
 
-# ----------------------------------------------------
-# 1. 페이지 기본 설정 및 안내 문구
-# ----------------------------------------------------
+# 1. 페이지 기본 설정 (앱의 제목과 아이콘 설정)
 st.set_page_config(page_title="최신 뉴스 검색기", page_icon="📰", layout="centered")
 
-st.title("최신 뉴스 검색기 📰")
-# 무료 티어 제한 안내 문구 (요구사항 3)
-st.warning("💡 **안내:** 현재 Gemini API 무료 티어를 사용 중입니다. (분당 15회 요청 제한이 발생할 수 있습니다.)")
+# 2. 세션 상태(Session State) 초기화
+# Streamlit은 버튼을 누를 때마다 화면이 새로고침 됩니다.
+# 다운로드 버튼을 눌렀을 때 검색 결과가 날아가지 않도록 데이터를 임시 저장하는 공간입니다.
+if "news_data" not in st.session_state:
+    st.session_state.news_data = None
 
-# ----------------------------------------------------
-# 2. 검색 UI 및 Session State 초기화
-# ----------------------------------------------------
-# 다운로드 버튼을 눌러도 화면이 날아가지 않도록 상태(State)를 저장합니다.
-if 'news_data' not in st.session_state:
-    st.session_state['news_data'] = None
+# 3. 화면 UI 구성
+st.title("📰 최신 뉴스 검색 앱")
+st.warning("💡 **Gemini API 무료 티어 제한 안내:** 분당 최대 15회까지만 요청이 가능합니다. 너무 자주 검색 버튼을 누르면 오류가 발생할 수 있으니 천천히 사용해주세요.")
 
-keyword = st.text_input("궁금한 최신 뉴스 키워드를 입력하세요 (예: AI 인공지능, 한국 야구):")
+# 사용자로부터 검색어 입력받기
+keyword = st.text_input("검색할 뉴스 키워드를 입력하세요 (예: 인공지능, 전기차, 애플 등)")
 
-# ----------------------------------------------------
-# 3. 뉴스 검색 버튼 클릭 시 동작
-# ----------------------------------------------------
-if st.button("뉴스 검색 🔍"):
+# 4. 검색 버튼이 눌렸을 때의 동작
+if st.button("뉴스 검색"):
     if not keyword:
         st.error("키워드를 입력해주세요!")
     else:
-        with st.spinner(f"'{keyword}' 관련 최신 뉴스를 검색하고 요약하는 중입니다..."):
+        with st.spinner("최신 뉴스를 검색하고 요약하는 중입니다... (잠시만 기다려주세요)"):
             try:
-                # 클라이언트 초기화 (Codespaces Secret에 등록한 GEMINI_API_KEY를 자동 인식함)
+                # 환경변수에 등록한 GEMINI_API_KEY를 자동으로 읽어와 클라이언트를 생성합니다.
                 client = genai.Client()
                 
-                # 프롬프트: 검색 도구와 강제 JSON 기능은 동시 사용이 안되므로, 
-                # 프롬프트 자체에서 JSON 형태의 텍스트만 출력하도록 강력하게 지시합니다.
+                # 모델에게 구체적인 JSON 형태의 응답을 요구하는 프롬프트 작성
+                # (Search 도구와 JSON 강제 모드를 같이 쓸 수 없기 때문에 말로 설명해서 유도합니다)
                 prompt = f"""
-                다음 키워드에 대한 최신 뉴스 5건을 검색해줘: {keyword}
+                다음 키워드에 대한 가장 최신 뉴스 5건을 검색해주세요: "{keyword}"
                 
-                반드시 아래의 JSON 배열(Array) 형식으로만 응답해야 해. 
-                다른 인사말이나 마크다운(```json 등)은 절대 포함하지 말고, 오직 순수한 JSON만 출력해.[
-                    {{
-                        "title": "뉴스 기사의 정확한 제목",
-                        "url": "뉴스 기사의 원본 링크",
-                        "summary": "해당 뉴스 내용에 대한 3~4문장의 상세한 요약"
-                    }}
+                검색된 결과를 바탕으로 반드시 아래의 JSON 배열 형식으로만 응답해주세요. 
+                마크다운 코드 블록(```json 등)을 절대 사용하지 말고, 순수 JSON 텍스트만 출력하세요.[
+                  {{
+                    "title": "뉴스 기사 제목",
+                    "source": "언론사 이름",
+                    "date": "발행일 또는 시간",
+                    "url": "기사 원본 링크",
+                    "summary": "기사 내용에 대한 3~4문장 분량의 상세하고 알기 쉬운 요약"
+                  }}
                 ]
                 """
                 
-                # Gemini 2.5 Flash Lite 모델 호출 (Google Search 도구 포함)
+                # Gemini 2.5 Flash Lite 모델 호출 및 구글 검색 기능 활성화
                 response = client.models.generate_content(
                     model='gemini-2.5-flash-lite',
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        tools=[{"google_search": {}}], # 구글 검색 기능 활성화
-                        temperature=0.2, # 일관된 JSON 출력을 위해 온도를 낮춤
+                        tools=[{"google_search": {}}], # 구글 검색(Search Grounding) 활성화
+                        temperature=0.2, # 일관된 출력을 위해 창의성을 약간 낮춤
                     )
                 )
                 
-                # 모델이 응답한 텍스트에서 안전하게 JSON 부분만 추출 (정규표현식 사용)
-                raw_text = response.text
-                match = re.search(r'\[\s*\{.*?\}\s*\]', raw_text, re.DOTALL)
+                # 5. 텍스트 결과물에서 JSON 데이터만 안전하게 추출하기
+                response_text = response.text.strip()
                 
-                if match:
-                    json_str = match.group(0)
-                    # 문자열을 파이썬 리스트(딕셔너리)로 변환
-                    news_data = json.loads(json_str) 
-                    # 결과를 세션 스테이트에 저장 (화면 유지용)
-                    st.session_state['news_data'] = news_data
+                # AI가 혹시라도 ```json [내용] ``` 형태로 답변할 경우를 대비해 대괄호 안의 내용만 뽑아냅니다.
+                json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                if json_match:
+                    clean_json_text = json_match.group(0)
                 else:
-                    st.error("결과를 JSON으로 변환하는 데 실패했습니다. 다시 시도해 주세요.")
-                    st.write("원본 응답:", raw_text)
+                    clean_json_text = response_text
                     
+                # 문자열을 파이썬 딕셔너리 리스트로 변환
+                news_list = json.loads(clean_json_text)
+                
+                # 변환된 데이터를 세션 상태에 저장하여 다운로드 시에도 유지되게 함
+                st.session_state.news_data = news_list
+                
             except Exception as e:
-                st.error(f"API 호출 중 오류가 발생했습니다: {e}")
+                st.error(f"오류가 발생했습니다.\n(검색결과를 처리하는 중 문제가 발생했거나 무료 제공량을 초과했을 수 있습니다.)\n에러 내용: {e}")
 
-# ----------------------------------------------------
-# 4. 결과 출력 및 CSV 다운로드 (요구사항 2)
-# ----------------------------------------------------
-if st.session_state['news_data']:
-    news_list = st.session_state['news_data']
+# 6. 결과 화면 출력 및 CSV 다운로드 (데이터가 있을 때만 표시)
+if st.session_state.news_data:
+    st.divider() # 가로줄 긋기
+    st.subheader(f"✨ '{keyword}' 관련 최신 뉴스 결과")
     
-    st.success("검색이 완료되었습니다!")
-    
-    # CSV 다운로드 기능 준비
-    df = pd.DataFrame(news_list)
-    # 한글 깨짐 방지를 위해 utf-8-sig로 인코딩
-    csv = df.to_csv(index=False).encode('utf-8-sig') 
-    
-    # 다운로드 버튼 (누르더라도 Session State 덕분에 화면이 지워지지 않음)
-    st.download_button(
-        label="📥 결과 CSV 파일로 다운로드",
-        data=csv,
-        file_name=f"latest_news_{keyword}.csv",
-        mime="text/csv",
-    )
-    
-    st.markdown("---")
-    
-    # 카드 형태로 결과 예쁘게 보여주기
-    for idx, news in enumerate(news_list):
-        # 테두리가 있는 컨테이너 생성 (카드 UI 효과)
+    # 카드 형태로 뉴스 하나씩 예쁘게 출력하기
+    for item in st.session_state.news_data:
+        # border=True 옵션으로 카드 느낌의 테두리를 만들어줍니다.
         with st.container(border=True):
-            st.subheader(f"{idx+1}. {news.get('title', '제목 없음')}")
-            st.write(f"**요약:** {news.get('summary', '요약 정보가 없습니다.')}")
-            st.markdown(f"[🔗 원본 기사 읽기]({news.get('url', '#')})")
+            st.markdown(f"### {item.get('title', '제목 없음')}")
+            st.caption(f"🏢 **출처:** {item.get('source', '알 수 없음')} &nbsp;|&nbsp; 🕒 **날짜:** {item.get('date', '알 수 없음')}")
+            st.write(item.get('summary', '요약 내용이 없습니다.'))
+            st.markdown(f"[🔗 원본 기사 읽기]({item.get('url', '#')})")
+            
+    st.divider()
+    
+    # 7. CSV 다운로드 버튼 구현
+    # 리스트 데이터를 pandas 데이터프레임으로 변환
+    df = pd.DataFrame(st.session_state.news_data)
+    # 한글이 엑셀에서 깨지지 않도록 utf-8-sig 로 인코딩
+    csv_data = df.to_csv(index=False).encode('utf-8-sig')
+    
+    st.download_button(
+        label="📥 검색 결과 CSV로 다운로드",
+        data=csv_data,
+        file_name=f"news_search_{keyword}.csv",
+        mime="text/csv"
+    )
