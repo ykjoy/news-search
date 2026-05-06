@@ -76,7 +76,7 @@ with tab1:
                     
                     # 모델 호출 (안정적인 gemini-2.0-flash 사용)
                     response = client.models.generate_content(
-                        model='gemini-2.0-flash',
+                        model='gemini-2.5-flash-lite',
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             tools=[{"google_search": {}}],
