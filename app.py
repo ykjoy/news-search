@@ -245,7 +245,7 @@ def search_news_with_gemini(keyword: str, target_count: int = 5) -> list:
     config = types.GenerateContentConfig(
         tools=[grounding_tool],
         # 사실성 우선이므로 temperature 낮게
-        temperature=0.2,
+        temperature=0.0,
     )
 
     verified_articles: list = []
