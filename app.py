@@ -1,29 +1,32 @@
 """
-=========================================================
-최신 뉴스 검색 웹앱 (Streamlit + Gemini Search Grounding + Supabase)
----------------------------------------------------------
-[기능 요약]
-1) 키워드 입력 → Gemini의 Google Search 도구로 최신 뉴스 5건 검색
-2) 검색 결과를 카드 UI로 출력 + 체크박스로 선택 → Supabase 저장
-3) 저장된 뉴스 조회 화면
-4) 대시보드 (키워드별/일자별 차트)
-5) CSV 다운로드 버튼
+==========================================================
+📰 Gemini 최신 뉴스 검색 웹앱 (Streamlit + Supabase)
+==========================================================
+주요 기능
+  1) 키워드 입력 → Gemini API의 Google Search Grounding으로 최신 뉴스 5건 검색
+  2) 카드 형태로 결과 표시 + CSV 다운로드
+  3) 마음에 드는 기사를 Supabase(news_history)에 저장
+  4) 저장된 뉴스 조회 화면
+  5) 대시보드 (키워드별/일자별 차트)
 
-[중요 제약]
-- Gemini 의 Google Search 도구는 'response_mime_type=application/json' 같은
-  강제 JSON 포맷과 동시에 사용할 수 없습니다.
-  → 그래서 프롬프트로 "JSON만 출력" 을 강하게 요구하고, 모델 응답 텍스트를
-     직접 파싱(`json.loads`)합니다. 코드 펜스(```json ... ```)도 안전하게 제거합니다.
-- 모델이 만들어내는 URL 은 가끔 깨지거나(404) Google redirect 라퍼로 감싸지므로,
-  HEAD/GET 요청으로 실제 살아있는지 검증하고, 실패한 항목은 한 번 더 재검색합니다.
-=========================================================
+📌 중요한 기술 포인트
+  - google-genai SDK에서 Google Search 도구(grounding)와 강제 JSON 출력
+    (response_mime_type="application/json")은 동시에 사용할 수 없습니다.
+    → 따라서 "JSON만 출력하라"고 프롬프트로 강하게 지시하고,
+       응답에서 ```json ... ``` 코드펜스를 제거한 뒤 json.loads 로 파싱합니다.
+  - 환각(없는 기사 / 깨진 링크)을 줄이기 위해
+    (a) grounding_chunks 의 실제 검색 결과 URL과 교차 검증,
+    (b) HTTP HEAD/GET 요청으로 링크 살아있는지 확인,
+    (c) 부족하면 한 번 더 재요청(최대 2회) 하는 검증 루프를 둡니다.
 """
 
-import os
-import re
+# =========================================================
+# 0. 라이브러리
+# =========================================================
 import json
-import time
-from datetime import datetime, timezone
+import re
+import io
+from datetime import datetime, date
 from urllib.parse import urlparse
 
 import requests
@@ -37,499 +40,433 @@ from supabase import create_client, Client
 
 
 # =========================================================
-# 0) 기본 설정 / 상수
+# 1. 페이지 기본 설정
 # =========================================================
-
-# 무료 티어에서 "가장 빠르고 처리량이 높은" 모델은 2.5 Flash-Lite (15 RPM, 1,000 RPD).
-# Search Grounding 품질을 더 원하면 gemini-2.5-flash 로 바꿔도 됩니다(10 RPM).
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
-
-# 한 번에 가져올 뉴스 개수
-NUM_NEWS = 5
-
-# URL 검증 시 타임아웃(초)과 정상으로 간주할 HTTP 상태 코드
-URL_TIMEOUT = 6
-OK_STATUS = {200, 201, 202, 203, 301, 302, 303, 307, 308}
-
-# 페이지 전체 설정 (Streamlit 최상단에서 1회만 호출)
 st.set_page_config(
-    page_title="📰 최신 뉴스 검색기",
+    page_title="Gemini 최신 뉴스 검색",
     page_icon="📰",
     layout="wide",
 )
 
 
 # =========================================================
-# 1) 비밀키 로드 (Streamlit Secrets 우선, 없으면 환경변수)
+# 2. 시크릿(키) 로드
+#    - 로컬: .streamlit/secrets.toml
+#    - 배포: Streamlit Cloud의 [Settings > Secrets] UI
 # =========================================================
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+SUPABASE_URL   = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY   = st.secrets["SUPABASE_KEY"]   # anon public key
 
-def _get_secret(key: str, default: str = "") -> str:
-    """Streamlit Cloud의 Secrets 또는 로컬 환경변수에서 키를 읽어옵니다."""
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        # secrets.toml 이 없을 때도 에러나지 않도록 처리
-        pass
-    return os.environ.get(key, default)
-
-
-GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
-SUPABASE_URL = _get_secret("SUPABASE_URL")
-SUPABASE_KEY = _get_secret("SUPABASE_KEY")  # anon 또는 service_role 키
+# 무료 티어에서 가장 빠르고 처리량이 높은 모델
+# (2.5 Flash-Lite 가 가장 빠르고 가벼움. Search Grounding 지원)
+GEMINI_MODEL = "gemini-2.5-flash"             # 또는 "gemini-2.5-flash-lite"
 
 
 # =========================================================
-# 2) 클라이언트 초기화 (캐싱: 매번 새로 만들지 않도록)
+# 3. 클라이언트 초기화 (캐시로 1번만 생성)
 # =========================================================
-
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_gemini_client() -> genai.Client:
-    """google-genai 클라이언트 (앱 전체에서 1개만 생성)."""
-    if not GEMINI_API_KEY:
-        st.error("⚠️ GEMINI_API_KEY 가 설정되지 않았습니다. Secrets 를 확인하세요.")
-        st.stop()
+    """google-genai 클라이언트 생성 (앱 라이프타임 동안 1회)."""
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-@st.cache_resource(show_spinner=False)
-def get_supabase_client() -> Client:
-    """Supabase 클라이언트 (앱 전체에서 1개만 생성)."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        st.warning("⚠️ SUPABASE_URL / SUPABASE_KEY 가 설정되지 않았습니다. 저장 기능이 비활성화됩니다.")
-        return None
+@st.cache_resource
+def get_supabase() -> Client:
+    """Supabase 클라이언트 생성."""
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+gemini = get_gemini_client()
+sb     = get_supabase()
+
+
 # =========================================================
-# 3) Gemini 호출 - 검색 + JSON 파싱
+# 4. 유틸리티 함수들
 # =========================================================
-
-# 모델에게 항상 같은 형식으로 응답하도록 지시하는 시스템 프롬프트
-SYSTEM_PROMPT = """\
-당신은 한국어 뉴스 큐레이터입니다.
-사용자가 준 키워드에 대한 '최신' 뉴스 기사를 Google Search 도구로 찾아서
-반드시 아래 JSON 스키마에 맞춰 한국어로 답하세요.
-
-규칙:
-- 코드 펜스 없이 순수 JSON 만 출력합니다.
-- 정확히 N개의 객체를 가진 JSON 배열을 반환합니다.
-- 각 기사는 실제로 존재해야 하며, url 은 기사 원문 페이지 URL 이어야 합니다.
-- vertexaisearch.cloud.google.com / google.com/url 같은 리다이렉트 링크 대신
-  최종 언론사 도메인의 직링크를 사용하세요.
-- 같은 기사를 중복해서 넣지 마세요.
-- summary 는 한국어 3~4문장으로 작성합니다.
-
-JSON 스키마:
-[
-  {
-    "title": "기사 제목 (문자열)",
-    "source": "언론사명 (예: 연합뉴스, Reuters)",
-    "published_at": "YYYY-MM-DD 또는 'YYYY-MM-DD HH:MM' 형태. 정확한 날짜를 모르면 'unknown'",
-    "url": "실제 기사 원문 URL (https://...)",
-    "summary": "기사 핵심 내용을 담은 한국어 3~4문장 요약"
-  }
-]
-"""
-
-
-def _strip_code_fence(text: str) -> str:
-    """모델이 ```json ... ``` 으로 감싸 보낸 경우 코드 펜스를 제거합니다."""
+def strip_code_fence(text: str) -> str:
+    """모델이 ```json ... ``` 로 감싸 답할 때 코드펜스를 제거."""
     text = text.strip()
-    # ```json 또는 ``` 로 시작하는 펜스 제거
+    # 앞쪽 ```json 또는 ``` 제거
     text = re.sub(r"^```(?:json)?\s*", "", text)
+    # 뒤쪽 ``` 제거
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
 
-def _extract_json_array(text: str):
-    """본문에서 첫 번째 '[' ~ 마지막 ']' 구간을 잘라 JSON 으로 파싱합니다."""
-    text = _strip_code_fence(text)
+def extract_first_json_array(text: str) -> str:
+    """텍스트 안에서 첫 번째 JSON 배열만 추출 (잡설 섞여 있을 때 대비)."""
+    m = re.search(r"\[\s*{.*}\s*\]", text, flags=re.DOTALL)
+    return m.group(0) if m else text
+
+
+def is_url_alive(url: str, timeout: int = 6) -> bool:
+    """
+    링크가 실제로 살아있는지 확인.
+    - 일부 언론사가 HEAD 를 막아두므로 HEAD 실패 시 GET 재시도
+    - 200~399 면 OK 로 간주
+    """
+    headers = {
+        # 봇 차단을 피하기 위한 일반적인 브라우저 UA
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # 본문 안에 설명이 섞여 있을 수 있으니 배열만 추출 시도
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start:end + 1])
-        raise
+        r = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if 200 <= r.status_code < 400:
+            return True
+        # 일부 사이트는 HEAD 405 → GET 재시도
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True, stream=True)
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
 
 
-def call_gemini_search(keyword: str, model_name: str, n: int = NUM_NEWS) -> list[dict]:
+def domain_of(url: str) -> str:
+    """URL에서 도메인만 뽑기 (출처 표시용 보조)."""
+    try:
+        return urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        return ""
+
+
+# =========================================================
+# 5. Gemini 호출 — Google Search Grounding
+# =========================================================
+SEARCH_PROMPT_TEMPLATE = """\
+당신은 한국어 뉴스 큐레이터입니다.
+키워드: "{keyword}"
+
+작업:
+1) Google 검색으로 위 키워드와 관련된 **최근 7일 이내** 뉴스를 찾으세요.
+2) 서로 다른 출처에서 **5건**을 골라 주세요.
+3) 반드시 **실제로 존재하고 클릭 시 해당 기사로 이동하는 원본 기사 URL** 만 사용하세요.
+   (포털 메인, 검색결과, vertexaisearch.cloud.google.com 같은 리다이렉트 URL은 금지)
+4) 각 기사를 한국어 3~4문장으로 요약하세요.
+
+출력 형식: **JSON 배열만 출력**하세요. 설명/마크다운/코드펜스 모두 금지.
+스키마:
+[
+  {{
+    "title": "기사 제목",
+    "source": "언론사명 (예: 연합뉴스)",
+    "news_date": "YYYY-MM-DD",
+    "url": "https://원본기사주소",
+    "summary": "3~4문장 한국어 요약"
+  }}
+]
+정확히 5개의 객체로 구성된 JSON 배열만 출력하세요.
+"""
+
+
+def call_gemini_search(keyword: str) -> tuple[list[dict], list[str]]:
     """
-    Gemini 에 Google Search 도구를 켜고 호출합니다.
-    ⚠️ Google Search 도구와 response_mime_type=application/json 은 함께 못 씁니다.
-       그래서 프롬프트로 'JSON 만 출력' 을 강하게 지시하고 텍스트를 직접 파싱합니다.
+    Gemini 에 Google Search 툴을 켜서 호출.
+    반환:
+      - articles: 모델이 만든 JSON 리스트
+      - grounding_uris: 실제 검색이 참고한 출처 URL 리스트 (검증용)
     """
-    client = get_gemini_client()
-
-    # Search Grounding 도구 정의
-    grounding_tool = types.Tool(google_search=types.GoogleSearch())
-
-    # 생성 설정: tools 만 지정 (response_mime_type 같이 못 씀!)
     config = types.GenerateContentConfig(
-        tools=[grounding_tool],
-        temperature=0.2,                # 낮은 온도로 안정적인 JSON 형식 유지
-        system_instruction=SYSTEM_PROMPT,
+        # 🔑 Search Grounding 활성화
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        temperature=0.2,
     )
 
-    user_prompt = (
-        f"키워드: '{keyword}'\n"
-        f"위 키워드에 대한 가장 최근의 신뢰할 만한 뉴스 기사 {n}건을 찾아주세요. "
-        f"반드시 정확히 {n}개의 객체로 구성된 JSON 배열만 출력하세요."
-    )
-
-    response = client.models.generate_content(
-        model=model_name,
-        contents=user_prompt,
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=SEARCH_PROMPT_TEMPLATE.format(keyword=keyword),
         config=config,
     )
 
-    raw_text = (response.text or "").strip()
-    if not raw_text:
-        raise RuntimeError("Gemini 응답이 비어있습니다.")
+    # --- 본문 텍스트에서 JSON 파싱 ---
+    raw = response.text or ""
+    cleaned = strip_code_fence(raw)
+    cleaned = extract_first_json_array(cleaned)
 
-    items = _extract_json_array(raw_text)
-    if not isinstance(items, list):
-        raise RuntimeError("응답이 JSON 배열이 아닙니다.")
-
-    # grounding_chunks 의 실제 URL/도메인을 보조 정보로 함께 보관 (URL 검증/대체 후보)
-    grounding_urls = []
     try:
-        gm = response.candidates[0].grounding_metadata
-        if gm and gm.grounding_chunks:
-            for ch in gm.grounding_chunks:
+        articles = json.loads(cleaned)
+        if not isinstance(articles, list):
+            articles = []
+    except json.JSONDecodeError:
+        articles = []
+
+    # --- grounding 메타데이터에서 실제 검색 URL 수집 ---
+    grounding_uris: list[str] = []
+    try:
+        meta = response.candidates[0].grounding_metadata
+        if meta and meta.grounding_chunks:
+            for ch in meta.grounding_chunks:
                 if ch.web and ch.web.uri:
-                    grounding_urls.append({"uri": ch.web.uri, "title": ch.web.title or ""})
+                    grounding_uris.append(ch.web.uri)
     except Exception:
         pass
 
-    # 너무 많이/적게 받은 경우 보정
-    items = items[:n]
-    return items, grounding_urls
+    return articles, grounding_uris
 
 
 # =========================================================
-# 4) URL 유효성 검증 (실제 살아있는 기사인지 확인)
+# 6. 검증 루프 — 환각/죽은 링크 걸러내기
 # =========================================================
+def validate_articles(articles: list[dict]) -> list[dict]:
+    """필수 필드 존재 + 링크 살아있음 확인 + 중복 URL 제거."""
+    seen = set()
+    valid: list[dict] = []
+    for a in articles:
+        if not isinstance(a, dict):
+            continue
+        url = (a.get("url") or "").strip()
+        title = (a.get("title") or "").strip()
+        if not url or not title:
+            continue
+        if url in seen:
+            continue
+        # 구글 리다이렉트 URL 거부 (실제 기사 아님)
+        if "vertexaisearch.cloud.google.com" in url or "google.com/url" in url:
+            continue
+        if not url.startswith("http"):
+            continue
+        if not is_url_alive(url):
+            continue
+        seen.add(url)
+        # source 가 비어있으면 도메인으로 보충
+        if not a.get("source"):
+            a["source"] = domain_of(url)
+        valid.append(a)
+    return valid
 
-def is_valid_news_url(url: str) -> bool:
-    """기사 URL 이 실제로 응답하는지 HEAD → 실패 시 GET 으로 재시도해 확인합니다."""
-    if not url or not url.startswith(("http://", "https://")):
-        return False
 
-    # Gemini 가 vertexaisearch 리다이렉트 URL 을 넣으면 원문이 아니므로 실패 처리
-    host = urlparse(url).netloc.lower()
-    if "vertexaisearch.cloud.google.com" in host or host.endswith("google.com"):
-        # 단, news.google.com 같은 정상 뉴스 도메인은 허용
-        if not host.startswith("news.google.com"):
-            return False
+def search_news_with_retry(keyword: str, target: int = 5, max_rounds: int = 3) -> list[dict]:
+    """
+    충분한 유효 기사를 모을 때까지 최대 max_rounds 회까지 재시도.
+    """
+    pool: list[dict] = []
+    seen_urls = set()
 
-    headers = {
-        # 일부 언론사가 봇을 차단하므로 일반 브라우저 UA 로 위장
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    for attempt in range(max_rounds):
+        articles, _grounding = call_gemini_search(keyword)
+        validated = validate_articles(articles)
+        for a in validated:
+            if a["url"] not in seen_urls:
+                seen_urls.add(a["url"])
+                pool.append(a)
+        if len(pool) >= target:
+            break
+
+    return pool[:target]
+
+
+# =========================================================
+# 7. Supabase CRUD
+# =========================================================
+def save_article(keyword: str, article: dict) -> tuple[bool, str]:
+    """단일 기사 저장. URL UNIQUE 충돌 시 False 반환."""
+    payload = {
+        "keyword":   keyword,
+        "title":     article.get("title"),
+        "source":    article.get("source"),
+        "news_date": article.get("news_date"),
+        "url":       article.get("url"),
+        "summary":   article.get("summary"),
     }
     try:
-        r = requests.head(url, headers=headers, allow_redirects=True, timeout=URL_TIMEOUT)
-        if r.status_code in OK_STATUS:
-            return True
-        # HEAD 를 막는 사이트들이 많아 GET 으로 재시도 (본문은 일부만 받음)
-        r = requests.get(url, headers=headers, allow_redirects=True, timeout=URL_TIMEOUT, stream=True)
-        return r.status_code in OK_STATUS
-    except requests.RequestException:
-        return False
+        sb.table("news_history").insert(payload).execute()
+        return True, "저장 완료"
+    except Exception as e:
+        msg = str(e)
+        if "duplicate" in msg.lower() or "unique" in msg.lower() or "23505" in msg:
+            return False, "이미 저장된 기사입니다 (URL 중복)"
+        return False, f"저장 실패: {msg}"
 
 
-def validate_and_repair(items: list[dict], keyword: str, model_name: str, max_retry: int = 1) -> list[dict]:
-    """
-    각 기사 URL 을 검증하고, 깨진 항목이 있으면 한 번 더 Gemini 에 재요청해 보완합니다.
-    """
-    valid, broken = [], []
-    for it in items:
-        if is_valid_news_url(it.get("url", "")):
-            valid.append(it)
-        else:
-            broken.append(it)
-
-    # 모자란 만큼 재요청 (최대 max_retry 회)
-    retry = 0
-    while len(valid) < NUM_NEWS and retry < max_retry:
-        retry += 1
-        try:
-            extra_items, _ = call_gemini_search(
-                keyword + " (직링크 우선, 깨지지 않은 URL)",
-                model_name,
-                n=NUM_NEWS - len(valid),
-            )
-        except Exception:
-            break
-        for it in extra_items:
-            if it.get("url") in {v["url"] for v in valid}:
-                continue  # 중복 제거
-            if is_valid_news_url(it.get("url", "")):
-                valid.append(it)
-            if len(valid) >= NUM_NEWS:
-                break
-
-    return valid[:NUM_NEWS]
-
-
-# =========================================================
-# 5) Supabase 저장/조회 함수
-# =========================================================
-
-def save_articles(articles: list[dict], keyword: str) -> tuple[int, int]:
-    """선택된 기사들을 news_history 테이블에 INSERT. (성공, 중복) 개수 반환."""
-    sb = get_supabase_client()
-    if sb is None:
-        return 0, 0
-
-    inserted, duplicated = 0, 0
-    for a in articles:
-        row = {
-            "keyword": keyword,
-            "title": a.get("title", ""),
-            "source": a.get("source", ""),
-            "published_at": a.get("published_at", ""),
-            "url": a.get("url", ""),
-            "summary": a.get("summary", ""),
-            "searched_at": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            sb.table("news_history").insert(row).execute()
-            inserted += 1
-        except Exception as e:
-            # url unique 제약에 걸리면 중복으로 카운트
-            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
-                duplicated += 1
-            else:
-                st.error(f"저장 실패: {e}")
-    return inserted, duplicated
-
-
-@st.cache_data(ttl=30, show_spinner=False)
 def fetch_history(limit: int = 500) -> pd.DataFrame:
-    """저장된 뉴스 이력을 데이터프레임으로 반환 (30초 캐시)."""
-    sb = get_supabase_client()
-    if sb is None:
-        return pd.DataFrame()
-    res = (
-        sb.table("news_history")
-        .select("*")
-        .order("searched_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    df = pd.DataFrame(res.data or [])
-    if not df.empty:
-        df["searched_at"] = pd.to_datetime(df["searched_at"], errors="coerce", utc=True)
-    return df
+    """저장된 뉴스 전체 조회."""
+    res = sb.table("news_history") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+    return pd.DataFrame(res.data or [])
 
 
 # =========================================================
-# 6) UI 헬퍼 - 카드 렌더링
+# 8. UI — 사이드바 메뉴
 # =========================================================
-
-def render_card(idx: int, article: dict, with_checkbox: bool = True) -> bool:
-    """기사 1건을 카드 UI 로 렌더링. 체크박스 선택 여부를 반환."""
-    with st.container(border=True):
-        st.markdown(f"### {idx}. {article.get('title', '(제목 없음)')}")
-        meta_cols = st.columns([2, 2, 6])
-        meta_cols[0].markdown(f"**📰 출처:** {article.get('source', '-')}")
-        meta_cols[1].markdown(f"**🗓 날짜:** {article.get('published_at', '-')}")
-        url = article.get("url", "")
-        meta_cols[2].markdown(f"**🔗 [원문 링크 열기]({url})**" if url else "**🔗 -**")
-        st.write(article.get("summary", ""))
-        if with_checkbox:
-            return st.checkbox(
-                "💾 이 기사 저장하기",
-                key=f"save_{idx}_{url}",
-                value=False,
-            )
-    return False
-
-
-# =========================================================
-# 7) 메인 앱 - 사이드바 + 3개 탭
-# =========================================================
-
-st.title("📰 최신 뉴스 검색기")
-
-# 무료 티어 안내 (요구사항 4번)
-st.info(
-    "ℹ️ **Gemini API 무료 티어 안내** — "
-    "본 앱은 기본적으로 `gemini-2.5-flash-lite` 모델을 사용합니다. "
-    "무료 티어 한도는 모델별로 다르며 대표적으로 **분당 15회(RPM), 일 1,000회(RPD)** 수준입니다. "
-    "한도를 초과하면 `429 RESOURCE_EXHAUSTED` 에러가 발생하니, 잠시 기다렸다 다시 시도해 주세요. "
-    "(최신 한도는 [공식 문서](https://ai.google.dev/gemini-api/docs/rate-limits) 참고)"
+st.sidebar.title("📰 뉴스 앱")
+menu = st.sidebar.radio(
+    "메뉴",
+    ["🔎 뉴스 검색", "🗂 저장된 뉴스", "📊 대시보드"],
 )
 
-with st.sidebar:
-    st.header("⚙️ 설정")
-    model_name = st.selectbox(
-        "Gemini 모델",
-        options=["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
-        index=0,
-        help="무료 티어에서 가장 빠른 모델이 기본값입니다.",
-    )
-    st.caption("Search Grounding 은 강제 JSON(response_mime_type) 과 동시 사용 불가하여, 프롬프트로 JSON 형식을 유도합니다.")
-
-tab_search, tab_saved, tab_dash = st.tabs(["🔍 검색", "📚 저장된 뉴스", "📊 대시보드"])
+# 무료 티어 안내 (모든 페이지 상단 공통)
+st.info(
+    "ℹ️ **Gemini API 무료 티어 안내** — 본 앱은 무료 티어용 모델 "
+    f"`{GEMINI_MODEL}` 을 사용합니다. 무료 티어는 모델·시점에 따라 "
+    "**분당 약 10~15회(RPM), 일일 약 250회(RPD)** 등의 한도가 있습니다. "
+    "한도 초과 시 잠시 기다렸다 다시 시도하세요. "
+    "최신 한도는 [공식 문서](https://ai.google.dev/gemini-api/docs/rate-limits) 참고.",
+    icon="ℹ️",
+)
 
 
-# ---------- (탭1) 검색 ----------
-with tab_search:
-    st.subheader("🔍 키워드로 최신 뉴스 검색")
+# =========================================================
+# 9. 페이지 1 — 뉴스 검색
+# =========================================================
+if menu == "🔎 뉴스 검색":
+    st.title("🔎 키워드로 최신 뉴스 검색")
 
-    col_in, col_btn = st.columns([5, 1])
-    keyword = col_in.text_input("검색 키워드", placeholder="예: 인공지능 반도체, 한국은행 기준금리, 손흥민 ...")
-    do_search = col_btn.button("검색", type="primary", use_container_width=True)
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        keyword = st.text_input("키워드를 입력하세요", placeholder="예: AI 반도체, 금리 인하, 기후변화 …")
+    with col2:
+        st.write("")  # 정렬용 여백
+        run = st.button("검색", type="primary", use_container_width=True)
 
-    if do_search and keyword.strip():
-        with st.spinner("Gemini 가 Google 에서 최신 기사를 검색하고 있습니다..."):
-            try:
-                items, _grounding = call_gemini_search(keyword.strip(), model_name, NUM_NEWS)
-            except Exception as e:
-                st.error(f"검색 실패: {e}")
-                st.stop()
+    # 세션에 마지막 검색 결과 보존
+    if "last_results" not in st.session_state:
+        st.session_state.last_results = []
+        st.session_state.last_keyword = ""
 
-            with st.status("기사 URL 유효성 검증 중...", expanded=False) as status:
-                items = validate_and_repair(items, keyword.strip(), model_name, max_retry=1)
-                status.update(label=f"검증 완료: {len(items)}건", state="complete")
+    if run and keyword.strip():
+        with st.spinner("Gemini가 Google에서 최신 뉴스를 검색·검증 중입니다… (최대 30초)"):
+            results = search_news_with_retry(keyword.strip(), target=5, max_rounds=3)
+        st.session_state.last_results = results
+        st.session_state.last_keyword = keyword.strip()
 
-        if not items:
-            st.warning("유효한 기사를 찾지 못했습니다. 키워드를 바꿔서 다시 시도해 주세요.")
-        else:
-            # 세션에 저장 (저장 버튼/CSV 다운로드에 재사용)
-            st.session_state["last_keyword"] = keyword.strip()
-            st.session_state["last_items"] = items
+    results = st.session_state.last_results
+    keyword_now = st.session_state.last_keyword
 
-    # 결과 표시 (검색 직후 또는 새로고침 시 세션값 활용)
-    items = st.session_state.get("last_items", [])
-    last_keyword = st.session_state.get("last_keyword", "")
+    if results:
+        st.success(f"'{keyword_now}' 관련 기사 {len(results)}건을 찾았습니다.")
 
-    if items:
-        st.success(f"'{last_keyword}' 키워드로 {len(items)}건의 기사를 찾았습니다.")
+        # ---- 카드 렌더링 ----
+        for idx, art in enumerate(results):
+            with st.container(border=True):
+                st.markdown(f"### {art.get('title','(제목 없음)')}")
+                meta = " · ".join(filter(None, [
+                    f"🏷 **{art.get('source','')}**",
+                    f"📅 {art.get('news_date','')}",
+                    f"🔗 [{domain_of(art.get('url',''))}]({art.get('url','')})",
+                ]))
+                st.markdown(meta)
+                st.write(art.get("summary", ""))
 
-        selected_flags = []
-        for i, art in enumerate(items, start=1):
-            selected_flags.append(render_card(i, art, with_checkbox=True))
+                # 저장 버튼
+                if st.button("💾 이 기사 저장", key=f"save_{idx}"):
+                    ok, msg = save_article(keyword_now, art)
+                    (st.success if ok else st.warning)(msg)
 
-        # 저장 버튼
-        save_col, csv_col = st.columns([1, 1])
-        with save_col:
-            if st.button("✅ 선택한 기사 Supabase 에 저장", use_container_width=True):
-                chosen = [art for art, flag in zip(items, selected_flags) if flag]
-                if not chosen:
-                    st.warning("저장할 기사를 1개 이상 체크해 주세요.")
-                else:
-                    inserted, duplicated = save_articles(chosen, last_keyword)
-                    st.success(f"저장 완료! 신규 {inserted}건, 중복 {duplicated}건")
-                    # 캐시 무효화 → 저장된 뉴스 탭에 즉시 반영
-                    fetch_history.clear()
-
-        # CSV 다운로드 버튼
-        with csv_col:
-            df_export = pd.DataFrame(items)
-            df_export.insert(0, "keyword", last_keyword)
-            csv_bytes = df_export.to_csv(index=False).encode("utf-8-sig")  # 엑셀 한글 깨짐 방지
-            st.download_button(
-                "⬇️ 검색 결과 CSV 다운로드",
-                data=csv_bytes,
-                file_name=f"news_{last_keyword}_{datetime.now():%Y%m%d_%H%M%S}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        # ---- CSV 다운로드 ----
+        df = pd.DataFrame(results)
+        csv_buf = io.StringIO()
+        df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="⬇️ 검색 결과 CSV 다운로드",
+            data=csv_buf.getvalue(),
+            file_name=f"news_{keyword_now}_{datetime.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+        )
+    elif run:
+        st.warning("유효한 기사를 찾지 못했습니다. 키워드를 바꿔 다시 시도해 보세요.")
 
 
-# ---------- (탭2) 저장된 뉴스 ----------
-with tab_saved:
-    st.subheader("📚 저장된 뉴스 목록")
+# =========================================================
+# 10. 페이지 2 — 저장된 뉴스 조회
+# =========================================================
+elif menu == "🗂 저장된 뉴스":
+    st.title("🗂 저장된 뉴스")
 
-    df = fetch_history(limit=500)
+    df = fetch_history()
     if df.empty:
-        st.info("저장된 뉴스가 없습니다. '검색' 탭에서 기사를 저장해 보세요.")
+        st.info("아직 저장된 뉴스가 없습니다.")
     else:
-        # 키워드 필터
-        kw_options = ["(전체)"] + sorted(df["keyword"].dropna().unique().tolist())
-        sel_kw = st.selectbox("키워드 필터", kw_options)
-        view = df if sel_kw == "(전체)" else df[df["keyword"] == sel_kw]
+        # 필터
+        kw_filter = st.text_input("키워드 필터 (부분 일치)").strip()
+        view = df.copy()
+        if kw_filter:
+            view = view[view["keyword"].str.contains(kw_filter, case=False, na=False)]
 
         st.caption(f"총 {len(view)}건")
-        # 보기 좋은 컬럼 순서
-        show_cols = ["searched_at", "keyword", "title", "source", "published_at", "url", "summary"]
-        st.dataframe(
-            view[show_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "url": st.column_config.LinkColumn("원문 링크"),
-                "searched_at": st.column_config.DatetimeColumn("저장 시각", format="YYYY-MM-DD HH:mm"),
-            },
-        )
+        for _, row in view.iterrows():
+            with st.container(border=True):
+                st.markdown(f"### {row['title']}")
+                st.markdown(
+                    f"🏷 **{row['source']}** · 📅 {row['news_date']} · "
+                    f"🔎 키워드 `{row['keyword']}` · "
+                    f"🔗 [{domain_of(row['url'])}]({row['url']})"
+                )
+                if row.get("summary"):
+                    st.write(row["summary"])
+                st.caption(f"저장일: {row['created_at']}")
 
 
-# ---------- (탭3) 대시보드 ----------
-with tab_dash:
-    st.subheader("📊 대시보드")
+# =========================================================
+# 11. 페이지 3 — 대시보드
+# =========================================================
+elif menu == "📊 대시보드":
+    st.title("📊 대시보드")
 
     df = fetch_history(limit=2000)
     if df.empty:
-        st.info("표시할 데이터가 없습니다.")
-    else:
-        # 상단 KPI
-        c1, c2, c3 = st.columns(3)
-        c1.metric("총 저장 건수", f"{len(df):,}")
-        c2.metric("고유 키워드 수", f"{df['keyword'].nunique():,}")
-        c3.metric("최근 7일 저장",
-                  f"{(df['searched_at'] >= pd.Timestamp.utcnow() - pd.Timedelta(days=7)).sum():,}")
+        st.info("저장된 데이터가 있어야 통계를 볼 수 있습니다.")
+        st.stop()
 
-        st.divider()
+    # created_at 을 날짜로 변환
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    df["created_date"] = df["created_at"].dt.date
 
-        # 1) 키워드별 저장 건수 (Top 15)
-        st.markdown("#### 🔠 키워드별 저장 건수 (Top 15)")
-        kw_count = (
-            df.groupby("keyword").size().reset_index(name="count")
-            .sort_values("count", ascending=False).head(15)
-        )
-        chart_kw = (
-            alt.Chart(kw_count)
-            .mark_bar()
-            .encode(
-                x=alt.X("count:Q", title="건수"),
-                y=alt.Y("keyword:N", sort="-x", title="키워드"),
-                tooltip=["keyword", "count"],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(chart_kw, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("총 저장 건수",   len(df))
+    c2.metric("키워드 종류",    df["keyword"].nunique())
+    c3.metric("출처(언론사) 수", df["source"].nunique())
 
-        # 2) 일자별 저장 건수
-        st.markdown("#### 📅 일자별 저장 건수")
-        daily = (
-            df.assign(date=df["searched_at"].dt.tz_convert("Asia/Seoul").dt.date)
-            .groupby("date").size().reset_index(name="count")
-        )
-        chart_day = (
-            alt.Chart(daily)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("date:T", title="날짜"),
-                y=alt.Y("count:Q", title="건수"),
-                tooltip=["date", "count"],
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(chart_day, use_container_width=True)
+    st.divider()
 
-        # 3) 출처(언론사)별 비중
-        st.markdown("#### 🏢 출처별 비중 (Top 10)")
-        src_count = (
-            df.assign(source=df["source"].fillna("(미상)"))
-            .groupby("source").size().reset_index(name="count")
-            .sort_values("count", ascending=False).head(10)
+    # 키워드별 건수
+    st.subheader("🔑 키워드별 저장 건수 (Top 15)")
+    kw_count = (
+        df.groupby("keyword").size().reset_index(name="count")
+          .sort_values("count", ascending=False).head(15)
+    )
+    chart1 = (
+        alt.Chart(kw_count)
+        .mark_bar()
+        .encode(
+            x=alt.X("count:Q", title="건수"),
+            y=alt.Y("keyword:N", sort="-x", title="키워드"),
+            tooltip=["keyword", "count"],
         )
-        st.bar_chart(src_count, x="source", y="count", use_container_width=True)
+        .properties(height=400)
+    )
+    st.altair_chart(chart1, use_container_width=True)
+
+    # 일자별 건수
+    st.subheader("📅 일자별 저장 건수")
+    day_count = (
+        df.groupby("created_date").size().reset_index(name="count")
+          .sort_values("created_date")
+    )
+    chart2 = (
+        alt.Chart(day_count)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("created_date:T", title="저장일"),
+            y=alt.Y("count:Q", title="건수"),
+            tooltip=["created_date", "count"],
+        )
+        .properties(height=350)
+    )
+    st.altair_chart(chart2, use_container_width=True)
+
+    # 출처별 Top 10
+    st.subheader("📰 출처별 저장 건수 (Top 10)")
+    src_count = (
+        df.groupby("source").size().reset_index(name="count")
+          .sort_values("count", ascending=False).head(10)
+    )
+    st.dataframe(src_count, use_container_width=True, hide_index=True)
+
 
