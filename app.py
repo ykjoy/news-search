@@ -204,7 +204,7 @@ def verify_url_alive(url: str, timeout: int = 6) -> bool:
         return False
 
 
-def build_news_prompt(keyword: str, count: int = 5) -> str:
+def build_news_prompt(keyword: str, count: int = 3) -> str:
     """뉴스 검색 프롬프트 생성. 모델에게 강하게 'JSON만 출력' 요청."""
     today = date.today().isoformat()
     return f"""오늘 날짜는 {today} 입니다.
