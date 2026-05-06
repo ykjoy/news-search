@@ -1,6 +1,15 @@
-streamlit>=1.39.0
+# Streamlit 웹앱 프레임워크
+streamlit>=1.40.0
+
+# 최신 Google Gen AI SDK (주의: 구버전 google-generativeai 가 아닌 google-genai 입니다)
 google-genai>=1.0.0
+
+# Supabase Python 클라이언트
 supabase>=2.9.0
+
+# 데이터 처리 및 시각화
 pandas>=2.2.0
-plotly>=5.24.0
+altair>=5.4.0
+
+# 원본 기사 URL 유효성 검증용 (HEAD/GET 요청)
 requests>=2.32.0
