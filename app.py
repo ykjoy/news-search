@@ -92,7 +92,9 @@ with tab1:
                         for real_title, real_url in real_links.items():
                             # 제목이 일부라도 일치하면 (LLM이 제목을 줄였을 수 있으므로) 실제 URL 할당
                             if item['title'].lower() in real_title.lower() or real_title.lower() in item['title'].lower():
-                                item['url'] = real_url
+                                #[수정 완료] 구글 내부 임시 링크(grounding-api-redirect)가 아니고 정상적인 http 링크일 때만 덮어쓰기
+                                if real_url.startswith("http") and "grounding-api-redirect" not in real_url:
+                                    item['url'] = real_url
                                 break
                     # ----------------------------------------------------
                     
