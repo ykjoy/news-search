@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import json
 import re
-from datetime import datetime
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
@@ -15,26 +14,28 @@ st.set_page_config(page_title="최신 뉴스 검색 및 저장 앱", page_icon="
 # -------------------------------------------------------------------
 # 2. 비밀 키(Secrets) 불러오기 및 초기화
 # -------------------------------------------------------------------
+# Streamlit Cloud의 Secrets(또는 로컬의 .streamlit/secrets.toml)에서 키를 읽어옵니다.
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
 # Supabase 클라이언트 연결
-@st.cache_resource
+@st.cache_resource # 데이터베이스 연결을 매번 하지 않고 캐싱(저장)해두어 속도를 높입니다.
 def init_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 supabase = init_supabase()
 
-# Gemini 클라이언트 연결
+# Gemini 클라이언트 연결 (API 키 명시적 전달)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # -------------------------------------------------------------------
-# 3. 화면 UI 구성
+# 3. 화면 UI 구성 (3개의 탭 만들기)
 # -------------------------------------------------------------------
 st.title("📰 AI 최신 뉴스 검색 & 자동 저장기")
-st.info("💡 안내: Google 검색을 통해 실제 뉴스 링크를 가져오며, 결과는 Supabase DB에 자동 저장됩니다.")
+st.info("💡 안내: Gemini API 무료 티어를 사용하며, 검색된 결과는 자동으로 Supabase DB에 저장됩니다.")
 
+# 화면을 3개의 탭으로 나눕니다.
 tab1, tab2, tab3 = st.tabs(["🔍 검색하기", "💾 저장된 뉴스 보기", "📊 통계 분석"])
 
 # ==========================================
@@ -42,103 +43,89 @@ tab1, tab2, tab3 = st.tabs(["🔍 검색하기", "💾 저장된 뉴스 보기",
 # ==========================================
 with tab1:
     st.subheader("새로운 뉴스 검색")
-    keyword = st.text_input("검색할 뉴스 키워드를 입력하세요 (예: 테슬라 주가, 인공지능 트렌드)")
+    keyword = st.text_input("검색할 뉴스 키워드를 입력하세요 (예: 테슬라, 올림픽)")
     
     if st.button("뉴스 검색 및 자동 저장", type="primary"):
         if not keyword:
             st.warning("키워드를 입력해주세요!")
         else:
-            with st.spinner("최신 뉴스를 실시간 검색 중입니다..."):
+            with st.spinner("최신 뉴스를 검색하고 DB에 저장하는 중입니다..."):
                 try:
-                    # 현재 날짜 정보 제공 (최신성 보장)
-                    current_date = datetime.now().strftime("%Y-%m-%d")
-                    
-                    # 프롬프트: 정확한 URL 추출에 집중
+                    # 1. Gemini AI에 검색 및 요약 요청
                     prompt = f"""
-                    오늘 날짜는 {current_date}입니다. 
-                    키워드 '{keyword}'에 대한 가장 최신 뉴스 5건을 Google Search를 통해 검색하고 아래 형식으로 요약해주세요.
-
-                    [중요 요구사항]
-                    1. **실제 URL**: 검색 결과에 있는 원본 뉴스 기사의 '실제 URL'을 반드시 그대로 사용하세요. 절대 URL을 임의로 생성하거나 추측하지 마세요.
-                    2. **신뢰도**: 공식 언론사(예: 연합뉴스, 매일경제, BBC 등)의 기사를 우선하세요.
-                    3. **응답 형식**: 반드시 아래의 JSON 배열 형식으로만 응답하세요. 다른 설명은 생략하세요.
-
-                    [
-                      {{
-                        "title": "실제 뉴스 제목",
-                        "source": "언론사명",
-                        "news_date": "YYYY-MM-DD",
-                        "url": "확인된 실제 뉴스 URL",
-                        "summary": "3~4문장의 핵심 요약"
-                      }}
+                    다음 키워드에 대한 가장 최신 뉴스 5건을 검색하고 요약해주세요: '{keyword}'
+                    
+                    [요구사항]
+                    1. Google Search를 사용해 최신 정보를 가져오세요.
+                    2. **실제 URL**: 검색 결과에 있는 원본 뉴스 기사의 '실제 URL'을 반드시 그대로 사용하세요. 절대 URL을 임의로 생성하거나 추측하지 마세요.
+                     3. **신뢰도**: 공식 언론사(예: 연합뉴스, 매일경제, BBC 등)의 기사를 우선하세요.
+                     4. 각 뉴스별로 제목(title), 출처(source), 날짜(date), 원본 URL(url), 3~4문장의 요약(summary)을 작성하세요.
+                    5. 응답은 반드시 아래 형태의 JSON 배열(Array)로만 출력해야 합니다.[
+                        {{
+                            "title": "뉴스 제목",
+                            "source": "언론사 이름",
+                            "news_date": "YYYY-MM-DD",
+                            "url": "https://...",
+                            "summary": "3~4문장의 요약 내용"
+                        }}
                     ]
                     """
                     
-                    # 모델 호출 (안정적인 gemini-2.0-flash 사용)
                     response = client.models.generate_content(
                         model='gemini-2.5-flash-lite',
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             tools=[{"google_search": {}}],
-                            temperature=0.0  # 창의성을 낮추어 사실 관계(URL) 정확도 향상
+                            temperature=0.2
                         )
                     )
                     
-                    # JSON 결과 추출
+                    # 2. JSON 결과 추출
                     raw_text = response.text
-                    # JSON 부분만 정규식으로 추출
-                    json_match = re.search(r'\[.*\]', raw_text, re.DOTALL)
-                    if json_match:
-                        news_data = json.loads(json_match.group(0))
-                    else:
-                        # 정규식 실패 시 텍스트 전체 시도
-                        news_data = json.loads(raw_text)
+                    match = re.search(r'\[\s*\{.*?\}\s*\]', raw_text, re.DOTALL)
+                    clean_json_str = match.group(0) if match else raw_text
+                    news_data = json.loads(clean_json_str)
                     
-                    if not news_data:
-                        st.error("검색 결과를 가져오지 못했습니다. 다시 시도해주세요.")
-                    else:
-                        saved_count = 0
-                        duplicate_count = 0
+                    # 3. 화면에 출력 및 Supabase DB에 저장
+                    saved_count = 0
+                    duplicate_count = 0
+                    
+                    st.success(f"'{keyword}'에 대한 검색이 완료되었습니다!")
+                    
+                    for news in news_data:
+                        # 화면에 카드 형태로 보여주기
+                        with st.container(border=True):
+                            st.markdown(f"#### [{news.get('title')}]({news.get('url')})")
+                            st.caption(f"🏢 **출처:** {news.get('source')} | 📅 **날짜:** {news.get('news_date')}")
+                            st.write(news.get('summary'))
                         
-                        st.success(f"'{keyword}'에 대한 실제 뉴스 검색 완료!")
+                        # DB 저장을 위한 데이터 조립 (keyword 추가)
+                        db_record = {
+                            "keyword": keyword,
+                            "title": news.get("title"),
+                            "source": news.get("source"),
+                            "news_date": news.get("news_date"),
+                            "url": news.get("url"),
+                            "summary": news.get("summary")
+                        }
                         
-                        for news in news_data:
-                            # 1. URL 유효성 간단 체크 (http로 시작하는지)
-                            news_url = news.get('url', '#')
-                            if not news_url.startswith('http'):
-                                continue
-
-                            # 2. 화면 출력
-                            with st.container(border=True):
-                                st.markdown(f"#### [{news.get('title')}]({news_url})")
-                                st.caption(f"🏢 **출처:** {news.get('source')} | 📅 **날짜:** {news.get('news_date')}")
-                                st.write(news.get('summary'))
-                                st.markdown(f"🔗 [기사 원문 읽기]({news_url})")
-                            
-                            # 3. DB 저장
-                            db_record = {
-                                "keyword": keyword,
-                                "title": news.get("title"),
-                                "source": news.get("source"),
-                                "news_date": news.get("news_date"),
-                                "url": news_url,
-                                "summary": news.get("summary")
-                            }
-                            
-                            try:
-                                supabase.table("news_history").insert(db_record).execute()
-                                saved_count += 1
-                            except Exception as db_e:
-                                if "23505" in str(db_e): # 유니크 제약 조건 위반 (중복)
-                                    duplicate_count += 1
-                                else:
-                                    st.error(f"DB 저장 중 에러: {db_e}")
-                        
-                        st.toast(f"✅ 신규 저장: {saved_count}건 | 🔄 중복 제외: {duplicate_count}건")
+                        # DB에 저장 시도
+                        try:
+                            supabase.table("news_history").insert(db_record).execute()
+                            saved_count += 1
+                        except Exception as db_e:
+                            # url이 UNIQUE이므로, 이미 존재하는 URL이면 에러가 발생합니다.
+                            # 이를 이용해 중복 저장을 건너뜁니다.
+                            if "duplicate key value" in str(db_e) or "23505" in str(db_e):
+                                duplicate_count += 1
+                            else:
+                                st.error(f"DB 저장 중 에러 발생: {db_e}")
+                    
+                    # 저장 결과 요약 알림
+                    st.toast(f"✅ 새로 저장됨: {saved_count}건 | 🔄 중복 생략됨: {duplicate_count}건")
 
                 except Exception as e:
                     st.error(f"오류가 발생했습니다: {e}")
-                    st.write("상세 에러 내용:", e)
 
 # ==========================================
 # 탭 2: 저장된 뉴스 보기
@@ -146,6 +133,7 @@ with tab1:
 with tab2:
     st.subheader("데이터베이스에 저장된 뉴스 목록")
     
+    # Supabase에서 데이터 불러오기 (최신순 정렬)
     try:
         response = supabase.table("news_history").select("*").order("created_at", desc=True).execute()
         db_data = response.data
@@ -153,43 +141,60 @@ with tab2:
         if db_data:
             df = pd.DataFrame(db_data)
             
-            search_term = st.text_input("목록 내 필터링 (제목 또는 키워드)", "")
+            # 사용자 편의를 위한 키워드 검색 필터 제공
+            search_term = st.text_input("목록 내 키워드 필터링 (제목, 키워드 기준)", "")
+            
             if search_term:
+                # 대소문자 구분 없이 필터링
                 df = df[df["keyword"].str.contains(search_term, case=False, na=False) | 
                         df["title"].str.contains(search_term, case=False, na=False)]
             
-            # URL을 클릭 가능한 링크로 변환하여 보여주기 위해 컬럼 설정
+            # 화면에 표(Dataframe) 형태로 보여주기
             st.dataframe(
                 df[["keyword", "title", "source", "news_date", "url", "created_at"]], 
                 use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "url": st.column_config.LinkColumn("기사 링크")
-                }
+                hide_index=True
             )
             
+            # CSV 다운로드 기능
             csv_data = df.to_csv(index=False, encoding='utf-8-sig')
-            st.download_button("📥 CSV 다운로드", data=csv_data, file_name="news_history.csv", mime="text/csv")
+            st.download_button(
+                label="📥 현재 표의 데이터 CSV 다운로드",
+                data=csv_data,
+                file_name="saved_news_history.csv",
+                mime="text/csv"
+            )
         else:
-            st.info("저장된 뉴스가 없습니다.")
+            st.info("아직 저장된 뉴스가 없습니다. 탭 1에서 뉴스를 검색해보세요!")
             
     except Exception as e:
-        st.error(f"데이터 로드 중 오류: {e}")
+        st.error(f"DB 데이터를 불러오는 중 오류가 발생했습니다: {e}")
 
 # ==========================================
-# 탭 3: 통계 분석
+# 탭 3: 통계 분석 (차트)
 # ==========================================
 with tab3:
-    st.subheader("검색 통계")
-    if 'db_data' in locals() and db_data:
+    st.subheader("검색 통계 대시보드")
+    
+    if 'db_data' in locals() and db_data: # 탭 2에서 불러온 데이터가 있다면 활용
         df_stats = pd.DataFrame(db_data)
+        
         col1, col2 = st.columns(2)
+        
         with col1:
-            st.write("**📌 키워드별 검색 건수**")
-            st.bar_chart(df_stats['keyword'].value_counts())
+            st.markdown("**📌 키워드별 누적 검색 건수**")
+            # 키워드별로 그룹화하여 개수 세기
+            keyword_counts = df_stats['keyword'].value_counts()
+            # Streamlit 내장 바 차트로 그리기
+            st.bar_chart(keyword_counts)
+            
         with col2:
-            st.write("**📌 날짜별 저장 추이**")
+            st.markdown("**📌 일자별 DB 저장 건수**")
+            # created_at (예: 2024-05-01T12:00:00) 문자열에서 날짜(YYYY-MM-DD)만 추출
             df_stats['date_only'] = pd.to_datetime(df_stats['created_at']).dt.date
-            st.line_chart(df_stats['date_only'].value_counts().sort_index())
+            # 일자별로 개수 세기
+            date_counts = df_stats['date_only'].value_counts().sort_index()
+            # Streamlit 내장 라인 차트로 그리기
+            st.line_chart(date_counts)
     else:
-        st.info("데이터가 없습니다.")
+        st.info("통계를 표시할 데이터가 부족합니다.")
