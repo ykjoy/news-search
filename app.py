@@ -55,7 +55,7 @@ with tab1:
                     #    ⚠️ URL은 모델에게 직접 만들게 하지 않습니다 (hallucination 방지).
                     #    대신 "몇 번째 grounding source를 참고했는지"만 정수로 답하게 합니다.
                     prompt = f"""
-                    다음 키워드에 대한 가장 최신 뉴스 5건을 검색하고 요약해주세요: '{keyword}'
+                    다음 키워드에 대한 가장 최신 뉴스 2건을 검색하고 요약해주세요: '{keyword}'
 
                     [매우 중요한 규칙 - 반드시 지킬 것]
                     1. 반드시 Google Search 도구를 사용해 실제 검색 결과(grounding sources)에 기반해서만 작성하세요.
