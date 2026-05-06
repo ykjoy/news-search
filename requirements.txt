@@ -1,12 +1,23 @@
-# Streamlit 웹 프레임워크
-streamlit>=1.39.0
+# =====================================================================
+# requirements.txt - 이 앱이 필요로 하는 파이썬 패키지 목록
+# Streamlit Community Cloud는 이 파일을 보고 자동으로 설치합니다.
+# =====================================================================
 
-# Google Gemini 최신 SDK (구 google-generativeai가 아님에 주의!)
+# Streamlit: 파이썬 코드만으로 웹앱을 만들 수 있게 해주는 프레임워크
+streamlit>=1.40.0
+
+# Google Gen AI SDK: Gemini API의 최신 공식 파이썬 SDK
+# (구 google-generativeai 가 아닌, 새로운 google-genai 입니다)
 google-genai>=1.0.0
 
-# Supabase Python 클라이언트
-supabase>=2.9.0
+# Supabase 파이썬 클라이언트: PostgreSQL DB에 접근
+supabase>=2.10.0
 
-# 데이터 처리 / 차트
+# 데이터 처리 및 차트
 pandas>=2.2.0
-altair>=5.4.0
+
+# URL 유효성 검증을 위한 HTTP 요청 라이브러리
+requests>=2.32.0
+
+# 대시보드의 인터랙티브 차트 (Streamlit 내장 대신 더 예쁜 그래프용)
+plotly>=5.24.0
