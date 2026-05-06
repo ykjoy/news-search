@@ -17,7 +17,10 @@
   - 환각(없는 기사 / 깨진 링크)을 줄이기 위해
     (a) grounding_chunks 의 실제 검색 결과 URL과 교차 검증,
     (b) HTTP HEAD/GET 요청으로 링크 살아있는지 확인,
-    (c) 부족하면 한 번 더 재요청(최대 2회) 하는 검증 루프를 둡니다.
+    (c) 부족하면 한 번 더 재요청(최대 3회) 하는 검증 루프를 둡니다.
+  - Gemini 서버의 5xx(ServerError) 일시 장애에 대비해
+    (a) 동일 모델 지수 백오프 재시도(최대 3회),
+    (b) 실패 시 다른 모델로 폴백(2.5-flash → 2.5-flash-lite → 2.0-flash) 합니다.
 """
 
 # =========================================================
@@ -26,7 +29,8 @@
 import json
 import re
 import io
-from datetime import datetime, date
+import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
@@ -36,6 +40,7 @@ import streamlit as st
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 from supabase import create_client, Client
 
 
@@ -58,9 +63,13 @@ GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SUPABASE_URL   = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY   = st.secrets["SUPABASE_KEY"]   # anon public key
 
-# 무료 티어에서 가장 빠르고 처리량이 높은 모델
-# (2.5 Flash-Lite 가 가장 빠르고 가벼움. Search Grounding 지원)
-GEMINI_MODEL = "gemini-2.5-flash"             # 또는 "gemini-2.5-flash-lite"
+# 무료 티어에서 빠른 순서대로 후보 모델을 둡니다.
+# 한 모델이 5xx(서버 일시 장애)를 내면 다음 모델로 자동 폴백합니다.
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+]
 
 
 # =========================================================
@@ -88,9 +97,7 @@ sb     = get_supabase()
 def strip_code_fence(text: str) -> str:
     """모델이 ```json ... ``` 로 감싸 답할 때 코드펜스를 제거."""
     text = text.strip()
-    # 앞쪽 ```json 또는 ``` 제거
     text = re.sub(r"^```(?:json)?\s*", "", text)
-    # 뒤쪽 ``` 제거
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
@@ -108,7 +115,6 @@ def is_url_alive(url: str, timeout: int = 6) -> bool:
     - 200~399 면 OK 로 간주
     """
     headers = {
-        # 봇 차단을 피하기 위한 일반적인 브라우저 UA
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -120,7 +126,8 @@ def is_url_alive(url: str, timeout: int = 6) -> bool:
         if 200 <= r.status_code < 400:
             return True
         # 일부 사이트는 HEAD 405 → GET 재시도
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True, stream=True)
+        r = requests.get(url, headers=headers, timeout=timeout,
+                         allow_redirects=True, stream=True)
         return 200 <= r.status_code < 400
     except Exception:
         return False
@@ -135,7 +142,7 @@ def domain_of(url: str) -> str:
 
 
 # =========================================================
-# 5. Gemini 호출 — Google Search Grounding
+# 5. Gemini 호출 — Google Search Grounding (+ 재시도/폴백)
 # =========================================================
 SEARCH_PROMPT_TEMPLATE = """\
 당신은 한국어 뉴스 큐레이터입니다.
@@ -163,30 +170,63 @@ SEARCH_PROMPT_TEMPLATE = """\
 """
 
 
+def _generate_with_retry(model: str, prompt: str,
+                         config: types.GenerateContentConfig):
+    """
+    동일 모델에 대해 5xx(서버 에러) 발생 시 지수 백오프로 최대 3회 재시도.
+    4xx(인증/한도/요청오류)는 재시도 의미가 없어 즉시 raise.
+    """
+    last_exc = None
+    for attempt in range(3):
+        try:
+            return gemini.models.generate_content(
+                model=model, contents=prompt, config=config
+            )
+        except genai_errors.ServerError as e:
+            last_exc = e
+            time.sleep(2 ** attempt)        # 1s, 2s, 4s
+        except genai_errors.ClientError:
+            raise
+    raise last_exc
+
+
 def call_gemini_search(keyword: str) -> tuple[list[dict], list[str]]:
     """
     Gemini 에 Google Search 툴을 켜서 호출.
+    여러 모델을 순서대로 시도하며, 각 모델별로 재시도 로직 적용.
     반환:
       - articles: 모델이 만든 JSON 리스트
       - grounding_uris: 실제 검색이 참고한 출처 URL 리스트 (검증용)
     """
     config = types.GenerateContentConfig(
-        # 🔑 Search Grounding 활성화
         tools=[types.Tool(google_search=types.GoogleSearch())],
         temperature=0.2,
     )
+    prompt = SEARCH_PROMPT_TEMPLATE.format(keyword=keyword)
 
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=SEARCH_PROMPT_TEMPLATE.format(keyword=keyword),
-        config=config,
-    )
+    response = None
+    last_error: Exception | None = None
 
-    # --- 본문 텍스트에서 JSON 파싱 ---
+    for model in GEMINI_MODELS:
+        try:
+            response = _generate_with_retry(model, prompt, config)
+            st.session_state["_used_model"] = model   # 디버그용 표시
+            break
+        except genai_errors.ServerError as e:
+            last_error = e
+            continue   # 다음 모델로 폴백
+        except genai_errors.ClientError as e:
+            # 키 잘못/한도 초과 등은 모델 바꿔도 동일하므로 중단
+            last_error = e
+            break
+
+    if response is None:
+        raise last_error if last_error else RuntimeError("Gemini 호출 실패")
+
+    # ----- 본문 텍스트에서 JSON 파싱 -----
     raw = response.text or ""
     cleaned = strip_code_fence(raw)
     cleaned = extract_first_json_array(cleaned)
-
     try:
         articles = json.loads(cleaned)
         if not isinstance(articles, list):
@@ -194,7 +234,7 @@ def call_gemini_search(keyword: str) -> tuple[list[dict], list[str]]:
     except json.JSONDecodeError:
         articles = []
 
-    # --- grounding 메타데이터에서 실제 검색 URL 수집 ---
+    # ----- grounding 메타데이터에서 실제 검색 URL 수집 -----
     grounding_uris: list[str] = []
     try:
         meta = response.candidates[0].grounding_metadata
@@ -232,21 +272,19 @@ def validate_articles(articles: list[dict]) -> list[dict]:
         if not is_url_alive(url):
             continue
         seen.add(url)
-        # source 가 비어있으면 도메인으로 보충
         if not a.get("source"):
             a["source"] = domain_of(url)
         valid.append(a)
     return valid
 
 
-def search_news_with_retry(keyword: str, target: int = 5, max_rounds: int = 3) -> list[dict]:
-    """
-    충분한 유효 기사를 모을 때까지 최대 max_rounds 회까지 재시도.
-    """
+def search_news_with_retry(keyword: str, target: int = 5,
+                           max_rounds: int = 3) -> list[dict]:
+    """충분한 유효 기사를 모을 때까지 최대 max_rounds 회까지 재시도."""
     pool: list[dict] = []
     seen_urls = set()
 
-    for attempt in range(max_rounds):
+    for _ in range(max_rounds):
         articles, _grounding = call_gemini_search(keyword)
         validated = validate_articles(articles)
         for a in validated:
@@ -284,11 +322,13 @@ def save_article(keyword: str, article: dict) -> tuple[bool, str]:
 
 def fetch_history(limit: int = 500) -> pd.DataFrame:
     """저장된 뉴스 전체 조회."""
-    res = sb.table("news_history") \
-            .select("*") \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+    res = (
+        sb.table("news_history")
+          .select("*")
+          .order("created_at", desc=True)
+          .limit(limit)
+          .execute()
+    )
     return pd.DataFrame(res.data or [])
 
 
@@ -301,11 +341,16 @@ menu = st.sidebar.radio(
     ["🔎 뉴스 검색", "🗂 저장된 뉴스", "📊 대시보드"],
 )
 
+# 마지막 호출에서 실제로 사용된 모델 표시 (디버그용)
+used_model = st.session_state.get("_used_model")
+if used_model:
+    st.sidebar.caption(f"마지막 사용 모델: `{used_model}`")
+
 # 무료 티어 안내 (모든 페이지 상단 공통)
 st.info(
-    "ℹ️ **Gemini API 무료 티어 안내** — 본 앱은 무료 티어용 모델 "
-    f"`{GEMINI_MODEL}` 을 사용합니다. 무료 티어는 모델·시점에 따라 "
-    "**분당 약 10~15회(RPM), 일일 약 250회(RPD)** 등의 한도가 있습니다. "
+    "ℹ️ **Gemini API 무료 티어 안내** — 본 앱은 무료 티어용 모델을 자동 선택해 사용합니다 "
+    f"(우선순위: {', '.join(f'`{m}`' for m in GEMINI_MODELS)}). "
+    "무료 티어는 모델·시점에 따라 **분당 약 10~15회(RPM), 일일 약 250회(RPD)** 등의 한도가 있습니다. "
     "한도 초과 시 잠시 기다렸다 다시 시도하세요. "
     "최신 한도는 [공식 문서](https://ai.google.dev/gemini-api/docs/rate-limits) 참고.",
     icon="ℹ️",
@@ -320,7 +365,10 @@ if menu == "🔎 뉴스 검색":
 
     col1, col2 = st.columns([4, 1])
     with col1:
-        keyword = st.text_input("키워드를 입력하세요", placeholder="예: AI 반도체, 금리 인하, 기후변화 …")
+        keyword = st.text_input(
+            "키워드를 입력하세요",
+            placeholder="예: AI 반도체, 금리 인하, 기후변화 …",
+        )
     with col2:
         st.write("")  # 정렬용 여백
         run = st.button("검색", type="primary", use_container_width=True)
@@ -332,9 +380,29 @@ if menu == "🔎 뉴스 검색":
 
     if run and keyword.strip():
         with st.spinner("Gemini가 Google에서 최신 뉴스를 검색·검증 중입니다… (최대 30초)"):
-            results = search_news_with_retry(keyword.strip(), target=5, max_rounds=3)
-        st.session_state.last_results = results
-        st.session_state.last_keyword = keyword.strip()
+            try:
+                results = search_news_with_retry(
+                    keyword.strip(), target=5, max_rounds=3
+                )
+                st.session_state.last_results = results
+                st.session_state.last_keyword = keyword.strip()
+            except genai_errors.ServerError as e:
+                st.error(
+                    "🛠️ Gemini 서버가 일시적으로 응답하지 않습니다(5xx). "
+                    "1~2분 뒤 다시 시도해 주세요.\n\n"
+                    f"세부 메시지: `{e}`"
+                )
+            except genai_errors.ClientError as e:
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg.upper():
+                    st.error(
+                        "⏱️ 무료 티어 호출 한도(분당/일일)를 초과했습니다. "
+                        "잠시 후 다시 시도해 주세요."
+                    )
+                else:
+                    st.error(f"요청 오류: {e}")
+            except Exception as e:
+                st.error(f"알 수 없는 오류: {e}")
 
     results = st.session_state.last_results
     keyword_now = st.session_state.last_keyword
@@ -354,7 +422,6 @@ if menu == "🔎 뉴스 검색":
                 st.markdown(meta)
                 st.write(art.get("summary", ""))
 
-                # 저장 버튼
                 if st.button("💾 이 기사 저장", key=f"save_{idx}"):
                     ok, msg = save_article(keyword_now, art)
                     (st.success if ok else st.warning)(msg)
@@ -369,7 +436,7 @@ if menu == "🔎 뉴스 검색":
             file_name=f"news_{keyword_now}_{datetime.now():%Y%m%d_%H%M}.csv",
             mime="text/csv",
         )
-    elif run:
+    elif run and not st.session_state.last_results:
         st.warning("유효한 기사를 찾지 못했습니다. 키워드를 바꿔 다시 시도해 보세요.")
 
 
@@ -383,7 +450,6 @@ elif menu == "🗂 저장된 뉴스":
     if df.empty:
         st.info("아직 저장된 뉴스가 없습니다.")
     else:
-        # 필터
         kw_filter = st.text_input("키워드 필터 (부분 일치)").strip()
         view = df.copy()
         if kw_filter:
@@ -414,7 +480,6 @@ elif menu == "📊 대시보드":
         st.info("저장된 데이터가 있어야 통계를 볼 수 있습니다.")
         st.stop()
 
-    # created_at 을 날짜로 변환
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
     df["created_date"] = df["created_at"].dt.date
 
